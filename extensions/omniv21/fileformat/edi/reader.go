@@ -102,10 +102,23 @@ type ediReader struct {
 	targetXPath        *xpath.Expr
 	runeBegin, runeEnd int
 	unprocessedRawSeg  rawSeg
+
+	verbose bool
 }
 
 func inRange(i, lowerBoundInclusive, upperBoundInclusive int) bool {
 	return i >= lowerBoundInclusive && i <= upperBoundInclusive
+}
+
+func (r *ediReader) whenVerbose(f func()) {
+	if !r.verbose {
+		return
+	}
+	f()
+}
+
+func (r *ediReader) vprintf(format string, a ...interface{}) {
+	r.whenVerbose(func() { fmt.Printf(format, a...) })
 }
 
 // stackTop returns the pointer to the 'frame'-th stack entry from the top.
@@ -212,6 +225,10 @@ func (r *ediReader) getUnprocessedRawSeg() (rawSeg, error) {
 	if *r.segDelim.strptr == "\n" && bytes.HasSuffix(noSegDelim, crBytes) {
 		noSegDelim = noSegDelim[:len(noSegDelim)-utf8.RuneLen('\r')]
 	}
+	// not using r.vprintf to eliminate unnecessary `string(noSegDelim)` memory allocation when verbose=false.
+	r.whenVerbose(func() {
+		fmt.Printf("raw segment retrieved (between character [%d,%d]): %s\n", r.runeBegin, r.runeEnd-1, string(noSegDelim))
+	})
 	for i, elem := range strs.ByteSplitWithEsc(noSegDelim, r.elemDelim.b, r.releaseChar.b, defaultElemsPerSeg) {
 		if len(r.compDelim.b) == 0 {
 			// if we don't have comp delimiter, treat the entire element as one component.
@@ -323,7 +340,7 @@ func (r *ediReader) segNext() error {
 		// the current values of [begin, end] cover the current instance of the current seg. But the error
 		// we're about to create is about the missing of next instance of the current seg. So just assign
 		// 'end' to 'begin' to make the error msg less confusing.
-		r.runeBegin = r.runeEnd
+		r.runeBegin = r.runeEnd - 1
 		return ErrInvalidEDI(r.fmtErrStr("segment '%s' needs min occur %d, but only got %d",
 			cur.segDecl.Name, cur.segDecl.minOccurs(), cur.occurred))
 	}
@@ -378,11 +395,23 @@ func (r *ediReader) Read() (*idr.Node, error) {
 		}
 		cur := r.stackTop()
 		if !cur.segDecl.matchSegName(rawSeg.name) {
+			if cur.segDecl.isGroup() {
+				r.vprintf("raw segment '%s' not matched to current segment_group '%s', skipping\n",
+					rawSeg.name, cur.segDecl.Name)
+			} else {
+				r.vprintf("raw segment '%s' not matched to current segment '%s', skipping\n",
+					rawSeg.name, cur.segDecl.Name)
+			}
 			err := r.segNext()
 			if err != nil {
 				return nil, err
 			}
 			continue
+		}
+		if cur.segDecl.isGroup() {
+			r.vprintf("raw segment '%s' matched to current segment_group '%s'\n", rawSeg.name, cur.segDecl.Name)
+		} else {
+			r.vprintf("raw segment '%s' matched to current segment '%s'\n", rawSeg.name, cur.segDecl.Name)
 		}
 		if !cur.segDecl.isGroup() {
 			cur.segNode, err = r.rawSegToNode(cur.segDecl)
@@ -421,7 +450,7 @@ func (r *ediReader) FmtErr(format string, args ...interface{}) error {
 
 func (r *ediReader) fmtErrStr(format string, args ...interface{}) string {
 	return fmt.Sprintf("input '%s' between character [%d,%d]: %s",
-		r.inputName, r.runeBegin, r.runeEnd, fmt.Sprintf(format, args...))
+		r.inputName, r.runeBegin, r.runeEnd-1, fmt.Sprintf(format, args...))
 }
 
 const (
@@ -464,6 +493,8 @@ func NewReader(inputName string, r io.Reader, decl *fileDecl, targetXPath string
 		runeBegin:         1,
 		runeEnd:           1,
 		unprocessedRawSeg: newRawSeg(),
+
+		verbose: true,
 	}
 	reader.growStack(stackEntry{
 		segDecl: &segDecl{
